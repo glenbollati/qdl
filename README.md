@@ -1,4 +1,4 @@
-# `qdl`
+# qdl
 
 A script wrapping `busybox httpd` and `stunnel` to provide a lightweight and portable file sharing system.
 
