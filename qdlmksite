@@ -1,0 +1,170 @@
+#!/bin/sh
+SRV_ROOT="/srv/qdl"
+FOOTER="<a href='https://srv.bollati.uk/git/glen/qdl'>qdl</a>
+is a lightweight, portable file sharing system"
+
+css="
+:root {
+	--bg-color:    #1c1c1c;
+	--fg-color:    #bfbbbb;
+	--link-color:  #8EC07C;
+	--hover-color: #FABD2F;
+	--alt-color:   #3a99ab;
+	text-rendering: optimizeLegibility;
+}
+
+body {
+	margin: 1em auto; 
+	max-width: 50em;
+	padding: 0 .62em;
+	font: 1.2em/1.5 monospace;
+	margin-left:  auto;
+	margin-right: auto;
+	background: var(--bg-color);
+	color:      var(--fg-color);
+}
+
+a {
+	color: var(--link-color);
+}
+
+a:hover { 
+	color: var(--hover-color);
+	text-decoration: underline;
+}
+
+h2 {
+	text-align: center;
+	color: var(--alt-color);
+}
+
+table {
+	width: 100%;
+	border-collapse: collapse;
+}
+
+footer {
+	font: 1.0em/1.2 monospace;
+	background-color: var(--bg-color);
+	position: fixed;
+	left: 0;
+	bottom: 0;
+	width: 100%;
+	text-align: center;
+	margin: auto;
+	padding: auto;
+}
+
+th, td {
+	border: thin solid var(--fg-color);
+	padding: 0.5em;
+}
+
+.centered {
+	text-align: center;
+	width: 50em;
+	top: 30%;
+	position: absolute;
+}
+
+hr {
+	height: 1px;
+	border-width: 0;
+	color: var(--alt-color);
+	background-color: var(--alt-color);
+}
+
+.mainlink {
+	color: var(--alt-color);
+	text-decoration: none;
+}
+
+.mainlink:hover { 
+	color: var(--hover-color);
+	text-decoration: underline;
+}"
+
+root_page(){
+	echo "<!DOCTYPE html>
+	<html lang='en'>
+	<head>
+		<meta charset='utf-8'>
+		<meta name='viewport' content='width=device-width, initial-scale=1.0'>
+		<link rel='stylesheet' type='text/css' href='/style.css'>
+		<title>QDL</title>
+	</head>
+	<body>
+		<div class='centered'>
+		<h2>Lightweight file hosting</h2>
+		<hr><br>
+		<h3>Browse the <a href='/public'>public area</a></h3>
+		</div>
+	</body>
+	<footer>
+		<small>$FOOTER</small>
+	</footer>
+	</html>"
+}
+
+fill_template (){
+	echo "<!DOCTYPE html>
+	<html lang='en'>
+	<head>
+		<meta charset='utf-8'>
+		<meta name='viewport' content='width=device-width, initial-scale=1.0'>
+		<link rel='stylesheet' type='text/css' href='/style.css'>
+		<title>QDL: $DIRNAME</title>
+	</head>
+	<body>
+		<h2>$DIRNAME</h2>
+		<h3><a href='../'>Back</a></h3>
+		$BODY
+	</body>
+	<footer>
+		<small>$FOOTER</small>
+	</footer>
+	</html>"
+}
+
+prep_page(){
+	BODY="<table>"
+	for file in $(busybox find "$dir" -mindepth 1 -maxdepth 1 -type f -not -name "index.html" | sort); do
+		NAME="$(busybox basename $file)"
+		SIZE="$(busybox du -sh $file | cut -f1)"
+		BODY="$BODY
+		<tr>
+			<td>$NAME</td>
+			<td>$SIZE</td>
+			<td><a href=\"./$NAME\">View</a></td>
+			<td><a href=\"./$NAME\" download>Download</a></td>
+		</tr>"
+	done
+	for subdir in $(busybox find "$dir" -mindepth 1 -maxdepth 1 -type d | sort); do
+		NAME="$(busybox basename $subdir)"
+		COUNT="$(busybox find $subdir -mindepth 1 -not -name "index.html" | wc -l)"
+		SIZE="$(busybox du -sh $subdir | cut -f1)"
+		[ "$COUNT" -eq 1 ] && COUNT="($COUNT file)" || COUNT="($COUNT files)"
+		BODY="$BODY
+		<tr>
+			<td><a href=\"./$NAME\">$NAME</a> <small>$COUNT</small></td>
+			<td>$SIZE</td>
+		</tr>"
+	done
+	BODY="$BODY</table>"
+	[ "$BODY" != "<table></table>" ] || BODY="<h3>No files currently available</h3>"
+}
+
+mkdir -p "$SRV_ROOT/public" || exit 1
+root_page > $SRV_ROOT/index.html
+echo "$css" > $SRV_ROOT/style.css
+
+# NOTE: this fails for files with newlines
+OIFS="$IFS"
+IFS='
+'
+for dir in $(busybox find $SRV_ROOT -mindepth 1 -type d -not -name "tmp"); do
+	DIRNAME="$(busybox basename $dir)"
+	prep_page
+	fill_template > $dir/index.html
+done
+IFS="$OIFS"

@@ -1,0 +1,275 @@
+#!/bin/sh
+SRV_ROOT="/srv/qdl"
+SRV_TEMP="$SRV_ROOT/tmp"
+TMP_PREF="/tmp/qdl"
+SRV_TO="127.0.0.1"
+HTTP_PORT=8080
+HTTPS_PORT=8443
+HTTPD_CONF_PATH="$TMP_PREF/httpd_qdl.conf"
+HTTPD_PID_FILE="$TMP_PREF/httpd.pid"
+STUNNEL_PID_FILE="$TMP_PREF/stunnel.pid"
+
+# --- Set these ---
+PUSHOVER_TITLE="QDL"
+PUSHOVER_URL="https://api.pushover.net/1/messages.json"
+# PUSHOVER_DEVICE=""
+# PUSHOVER_TOKEN=
+# CERTIFICATE_PATH=
+
+die(){
+	printf "%s %s\n" "$(busybox date +'%b %d %X') qdl: ERROR -" "$*" >&2
+	exit 1
+}
+
+log(){
+	[ -n "$VERBOSE" ] || return 0
+	printf "%s %s\n" "$(busybox date +'%b %d %X') qdl:" "$*"
+}
+
+check_deps(){
+	# --- Add dependencies here ---
+	DEPS="busybox stunnel"
+	for i in $DEPS; do
+		if ! command -v $i > /dev/null 2>&1; then
+			[ -z "$UNMET" ] && UNMET="$i" || UNMET="$UNMET $i"
+		fi
+	done
+
+	# --- Add busybox dependencies here ---
+	BOX_DEPS="sleep httpd basename date wget"
+	for i in $BOX_DEPS; do
+		if ! busybox --list | grep -qw "$i"; then
+			[ -z "$UNMET" ] && UNMET="$i" || UNMET="$UNMET busybox-$i"
+		fi
+	done
+	[ -z "$UNMET" ] || die "unmet dependencies: $UNMET"
+}
+
+print_usage(){
+	echo "USAGE: qdl file /path/to/file [OPTIONS]..."
+	echo "   or: qdl [-v] kill"
+	echo "   or: qdl [-v] serve"
+	echo "   or: qdl help"
+	echo "   or: qdl usage"
+	echo "   or: qdl examples"
+	echo
+	echo "OPTIONS:"
+	echo "-v verbose"
+	echo "-f file     the file to share"
+	echo "-n name     name to give the file"
+	echo "-e expire   time after which to delete file, kill httpd and stunnel and exit"
+	echo "-p push     time after which to send a reminder through Pushover to remove file"
+	echo "            NOTE: the PUSHOVER_TOKEN variable must be set in your environment"
+	echo "            (or set it in the script/pass it from cmdline)"
+}
+
+print_examples(){
+	echo "EXAMPLES:"
+	echo "qdl serve"
+	echo "  start httpd and stunnel"
+	echo
+	echo "qdl kill"
+	echo "  kill httpd and stunnel"
+	echo
+	echo "qdl file /path/to/myfile name myfileforyou expire 10m"
+	echo '  serve "myfile" as "myfileforyou"'
+	echo "  after 10 minutes, delete the file, kill httpd and stunnel and exit"
+	echo "  if httpd and stunnel are not already running, they will be started up for you"
+	echo "  (as if you had run qdl serve)"
+	echo
+	echo "qdl file /path/to/myfile name myfileforyou push 10m"
+	echo '  serve "myfile" as "myfileforyou"'
+	echo "  after 10 minutes, send a reminder over Pushover to remove the file"
+	echo "  NOTE: to use Pushover, the PUSHOVER_TOKEN variable must be set in your environment"
+	echo "  (or set it in the script/pass it from cmdline)" 
+}
+
+print_help(){
+	print_usage; echo; print_examples
+}
+
+gen_cert(){
+	if ! command -v openssl > /dev/null 2>&1; then
+		die "unmet dependencies: openssl (required for certificate generation, see help)"
+	fi
+	openssl genrsa -out $TMP_PREF/key.pem 2048
+
+	openssl req -new -x509 -days 1095 \
+		-key $TMP_PREF/key.pem \
+		-out $TMP_PREF/cert.pem \
+		-subj "/C=GB/CN=localhost"
+
+	cat $TMP_PREF/key.pem $TMP_PREF/cert.pem >> $TMP_PREF/stunnel.pem 
+}
+
+start_stunnel(){
+	# If $CERTIFICATE_PATH is set, use the certificate at that path,
+	# otherwise attempt to generate one with openssl
+	if [ -n "$CERTIFICATE_PATH" ]; then
+		log "Using certificate at path: $CERTIFICATE_PATH"
+		STUNNEL_CERT="$CERTIFICATE_PATH"
+		[ -e "$STUNNEL_CERT" ] || die "No certificate found at $CERTIFICATE_PATH"
+	else
+		log "Generating certificate"
+		gen_cert > /dev/null 2>&1
+		STUNNEL_CERT="$TMP_PREF/stunnel.pem"
+		[ -e "$STUNNEL_CERT" ] || die "Failed to generate certificate"
+	fi
+
+	STUNNEL_CONF="
+	pid     = $STUNNEL_PID_FILE
+	[https]
+	accept  = $HTTPS_PORT
+	connect = $HTTP_PORT
+	cert    = $STUNNEL_CERT"
+
+	log "Starting stunnel (port $HTTPS_PORT => port $HTTP_PORT)"
+	echo "$STUNNEL_CONF" | stunnel -fd 0
+}
+
+rand_pwd(){
+	busybox tr -dc A-Za-z0-9 < /dev/urandom | busybox head -c 70
+}
+
+start_httpd(){
+	HTTPD_CONF="H:$SRV_ROOT
+	/user:username:userpass
+	/tmp:tmp:$(rand_pwd)"
+
+	log "Starting httpd (serving $SRV_ROOT at https://$SRV_TO:$HTTPS_PORT)"
+
+	printf "%s\n" "$HTTPD_CONF" > "$HTTPD_CONF_PATH"
+	busybox httpd -c $HTTPD_CONF_PATH -p $HTTP_PORT -f & HTTPD_PID=$!
+	echo "$HTTPD_PID" > "$TMP_PREF/httpd.pid"
+}
+
+cleanup(){
+	if [ -n "$ABS_FILE_PATH" ]; then
+		rm "$ABS_FILE_PATH" || exit 1
+	fi
+
+	if [ -e "$HTTPD_PID_FILE" ]; then
+		HTTPD_PID="$(cat $HTTPD_PID_FILE)"
+		log "Killing httpd (pid: $HTTPD_PID)"
+		if kill $HTTPD_PID; then
+			rm "$HTTPD_PID_FILE" "$HTTPD_CONF_PATH"
+		fi
+	fi
+
+	if [ -e "$STUNNEL_PID_FILE" ]; then
+		STUNNEL_PID="$(cat $STUNNEL_PID_FILE)"
+		log "Killing stunnel (pid: $STUNNEL_PID)"
+		if kill $STUNNEL_PID && [ -z "$CERTIFICATE_PATH" ]; then
+			rm "$TMP_PREF/stunnel.pem"
+		fi
+	fi
+}
+
+serve(){
+	cleanup
+	start_stunnel
+	start_httpd
+}
+
+set_file(){
+	[ -f $(busybox realpath "$1" > /dev/null) ] || \
+		die "You must specify a valid file to share"
+
+	FILE="$(busybox realpath "$1")"
+}
+
+set_name(){
+	[ -n "$1" ] || die "What do you want to name the file?"
+	NAME="$1"
+}
+
+set_pushover(){
+	#[ -n "$1" ] || die "You must specify a valid time range (parseable by busybox sleep)"
+	if ! printf "%s" "$1" | grep -Eq "[0-9]+[smhd]"; then
+		die "You must specify a valid time range (parseable by busybox sleep)"
+	fi
+	PUSHOVER=1
+	PUSH_AFTER="$1"
+}
+
+set_expire(){
+	#[ -n "$1" ] || die "You must specify a valid time range (parseable by busybox sleep)"
+	if ! printf "%s" "$1" | grep -Ewq "[0-9]+[smhd]"; then
+		die "You must specify a valid time range (parseable by busybox sleep)"
+	fi
+	EXPIRE="$1"
+}
+
+is_running(){
+	[ -e "$STUNNEL_PID_FILE" ] && [ -e "$HTTPD_PID_FILE" ]
+}
+
+print_status(){
+	if is_running; then
+		echo "Serving $SRV_ROOT at https://$SRV_TO:$HTTPS_PORT"
+		return 0
+	fi
+	echo "Not serving"
+	return 1
+}
+
+# --- Entry point ---
+check_deps
+mkdir -p "$SRV_ROOT" "$SRV_TEMP" "$TMP_PREF"
+
+if [ -z "$1" ]; then print_usage; exit 1; fi
+
+while [ -n "$1" ]; do
+	case "$1" in
+		"-v"|"verbose")  VERBOSE=1;         shift ;;
+		"-f"|"file")     set_file "$2";     shift; shift ;;
+		"-n"|"name")     set_name "$2";     shift; shift ;;
+		"-e"|"expire")   set_expire "$2";   shift; shift ;;
+		"-p"|"push")     set_pushover "$2"; shift; shift ;;
+		"-k"|"kill")     cleanup;           exit ;;
+		"-s"|"serve")    serve;             exit ;; 
+		"-z"|"status")   print_status;      exit ;;
+		"-u"|"usage")    print_usage;       exit ;;
+		"-x"|"examples") print_examples;    exit ;;
+		"-h"|"--help"|"help") print_help;   exit ;;
+		*) die "Unrecognised option: $1" ;;
+	esac
+done
+
+is_running || serve
+
+[ -n "$FILE" ] || die "You must provide the path to a file to serve"
+[ -n "$NAME" ] || NAME="$(busybox basename $FILE)"
+
+# Generate link
+ABS_FILE_PATH="$SRV_TEMP/$NAME"
+REL_FILE_PATH="$(busybox basename $SRV_TEMP)/$NAME"
+CREDENTIALS="$(busybox grep -E "/tmp:tmp:.*$" "$HTTPD_CONF_PATH" | cut -d':' -f2-)"
+LINK="https://$CREDENTIALS@$SRV_TO:$HTTPS_PORT/$REL_FILE_PATH"
+
+# Copy the file to the download location
+if ! cp "$FILE" "$ABS_FILE_PATH"; then exit 1; fi
+
+printf "%s\n" "--- Download link is ready: $LINK ---"
+
+if [ -n "$PUSHOVER" ]; then
+	[ -n "$PUSHOVER_TOKEN" ] || die "You must set the PUSHOVER_TOKEN variable (see help)"
+
+	PUSHOVER_MSG="Testing qdl: time to remove $NAME,"
+	PUSHOVER_MSG="$PUSHOVER_MSG made available at $(date +'%d %b %H:%M')"
+	PUSHOVER_MSG="$PUSHOVER_MSG (has been available for $PUSH_AFTER)"
+
+	PUSHOVER_POST_DATA="title=$PUSHOVER_TITLE&device=$PUSHOVER_DEVICE"
+	PUSHOVER_POST_DATA="$PUSHOVER_POST_DATA&token=$PUSHOVER_TOKEN"
+	PUSHOVER_POST_DATA="$PUSHOVER_POST_DATA&message=$PUSHOVER_MSG"
+
+	busybox sleep $PUSH_AFTER
+	log "Sending Pushover message: $PUSHOVER_MSG"
+	busybox wget --post-data="$PUSHOVER_POST_DATA" "$PUSHOVER_URL"
+fi
+
+if [ -n "$EXPIRE" ]; then
+	busybox sleep $EXPIRE
+	log "File $NAME has expired, deleting and cleaning up"
+	cleanup && exit 0
+fi
